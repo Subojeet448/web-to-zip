@@ -443,6 +443,17 @@ class UrlDownloader:
         self.failed_urls: Set[str] = set()
         self.crawled_pages: Set[str] = set()
         self.url_hash_map: dict = {}    # NEW: for diff tracking (url→md5)
+        # FIX: url -> real saved relative path (handles renamed duplicates)
+        self.url_local_map: dict = {}
+        # FIX: content-hash -> saved relative path (dedup without dead links)
+        self.hash_paths: dict = {}
+        # FIX: saved .css file path -> its source url (for deep CSS crawl)
+        self.css_sources: dict = {}
+        self.css_done: Set[str] = set()
+        # FIX: all assets live in ONE shared root folder (no per-page copies)
+        self.root_folder: str = ""
+        # FIX: page url -> saved html path (for local page-to-page links)
+        self.page_files: dict = {}
         self.extracted_content: List[dict] = []  # NEW: content extraction results
         self.stats = {
             "downloaded": 0, "failed": 0, "total_bytes": 0,
@@ -470,6 +481,8 @@ class UrlDownloader:
         try:
             os.makedirs(pagefolder, exist_ok=True)
             all_file_paths = []
+            self.root_folder = pagefolder      # FIX: shared asset root
+            pending_pages = []                 # FIX: write html after crawl
 
             # NEW: Load resume state
             resume_state = {}
@@ -567,10 +580,16 @@ class UrlDownloader:
                 if resource_urls:
                     await self._emit("downloading",
                                      f"{len(resource_urls)} resources on {current_url}", pct)
+                    # FIX: always store assets in the shared root folder
                     fp = await self._download_all_resources(
-                        resource_urls, page_subfolder, session, proxy
+                        resource_urls, pagefolder, session, proxy
                     )
                     all_file_paths.extend(fp)
+
+                # FIX: follow url()/@import inside downloaded CSS files and
+                # rewrite them to local relative paths (offline fonts/images)
+                fp_css = await self._process_css_assets(session, proxy)
+                all_file_paths.extend(fp_css)
 
                 await self._update_html_paths(soup, current_url, page_subfolder)
                 self._patch_offline(soup, current_url)
@@ -583,9 +602,10 @@ class UrlDownloader:
 
                 fname = 'index.html' if current_depth == 0 else f"{path_slug}.html"
                 html_path = os.path.join(page_subfolder, fname)
-                html_bytes = soup.prettify('utf-8')
-                async with aiofiles.open(html_path, 'wb') as f:
-                    await f.write(html_bytes)
+                # FIX: hold the page, write after crawl so <a href> can be
+                # rewritten to the other saved html files
+                self.page_files[self._page_key(current_url)] = html_path
+                pending_pages.append((html_path, soup, current_url))
                 all_file_paths.append(html_path)
 
                 if current_depth < self.crawl_depth:
@@ -605,6 +625,12 @@ class UrlDownloader:
                         "failed": list(self.failed_urls),
                         "pages_crawled": list(self.crawled_pages),
                     })
+
+            # FIX: rewrite internal <a href> to the local html files, then save
+            for html_path, soup, page_url in pending_pages:
+                self._link_pages(soup, page_url, os.path.dirname(html_path))
+                async with aiofiles.open(html_path, 'wb') as f:
+                    await f.write(soup.prettify('utf-8'))
 
             # NEW: Save diff hash map for next run
             if self.diff_mode:
@@ -690,28 +716,41 @@ class UrlDownloader:
         for link in soup.find_all('link', href=True):
             rel = link.get('rel', [])
             if isinstance(rel, str): rel = [rel]
-            if 'stylesheet' in rel or link.get('type') == 'text/css':
+            is_css = 'stylesheet' in rel or link.get('type') == 'text/css'
+            is_icon = any(r in rel for r in ['icon','shortcut icon',
+                                             'apple-touch-icon','mask-icon'])
+            # FIX: honour linkFlg / imgFlg / scriptFlg
+            if is_css and not self.linkFlg:
+                continue
+            if is_icon and not self.imgFlg:
+                continue
+            if 'modulepreload' in rel and not self.scriptFlg:
+                continue
+            if is_css:
                 urls.add(urljoin(base_url, link['href'].strip()))
             if any(r in rel for r in ['preload','prefetch','modulepreload','icon',
                                        'shortcut icon','apple-touch-icon','manifest',
                                        'mask-icon','alternate']):
                 urls.add(urljoin(base_url, link['href'].strip()))
-        for style in soup.find_all('style'):
-            if style.string:
-                urls.update(self._css_urls(style.string, base_url))
-        for tag in soup.find_all(style=True):
-            urls.update(self._css_urls(tag['style'], base_url))
-        for script in soup.find_all('script', src=True):
-            urls.add(urljoin(base_url, script['src'].strip()))
+        if self.linkFlg:                       # FIX: CSS only when enabled
+            for style in soup.find_all('style'):
+                if style.string:
+                    urls.update(self._css_urls(style.string, base_url))
+            for tag in soup.find_all(style=True):
+                urls.update(self._css_urls(tag['style'], base_url))
+        if self.scriptFlg:                     # FIX: JS only when enabled
+            for script in soup.find_all('script', src=True):
+                urls.add(urljoin(base_url, script['src'].strip()))
         IMG_ATTRS = ['src','data-src','data-lazy','data-original','data-lazy-src',
                      'data-bg','data-image','data-cover','data-poster','data-thumb']
-        for img in soup.find_all(['img','source','video','audio']):
+        for img in (soup.find_all(['img','source','video','audio'])
+                    if self.imgFlg else []):        # FIX: honour imgFlg
             for attr in IMG_ATTRS:
                 val = img.get(attr, '').strip()
                 if val: urls.add(urljoin(base_url, val))
             if img.get('srcset'):
                 urls.update(self._parse_srcset(img['srcset'], base_url))
-        for meta in soup.find_all('meta'):
+        for meta in (soup.find_all('meta') if self.imgFlg else []):  # FIX
             prop = meta.get('property','') or meta.get('name','')
             content = meta.get('content','').strip()
             if any(p in prop for p in ['image','og:','twitter:']) and content:
@@ -719,9 +758,10 @@ class UrlDownloader:
                     urls.add(content)
                 elif content.startswith('/'):
                     urls.add(urljoin(base_url, content))
-        for script in soup.find_all('script'):
-            if script.string:
-                urls.update(self._inline_script_urls(script.string, base_url))
+        if self.scriptFlg:            # FIX: inline-script URLs need scriptFlg
+            for script in soup.find_all('script'):
+                if script.string:
+                    urls.update(self._inline_script_urls(script.string, base_url))
         for tag in soup.find_all(True):
             for attr, val in tag.attrs.items():
                 if isinstance(val, str) and attr.startswith('data-') and val.strip():
@@ -824,7 +864,9 @@ class UrlDownloader:
     async def _download_single(self, url, file_path, session, proxy=None):
         async with self.semaphore:
             headers = {'User-Agent': get_ua(), 'Accept': '*/*',
-                       'Referer': url, 'Accept-Encoding': 'identity'}
+                       'Referer': url,
+                       # FIX: allow compressed transfer (aiohttp decodes it)
+                       'Accept-Encoding': 'gzip, deflate, br'}
             # NEW: inject auth on resource downloads too
             if self.cookies:
                 headers['Cookie'] = self.cookies
@@ -855,6 +897,11 @@ class UrlDownloader:
 
                         h = hashlib.md5(content).hexdigest()
                         if h in self.file_hashes:
+                            # FIX: reuse the already-saved copy so the html/css
+                            # link stays valid instead of pointing at nothing
+                            existing = self.hash_paths.get(h)
+                            if existing:
+                                self.url_local_map[url] = existing
                             self.stats["duplicates_skipped"] += 1
                             return False
                         self.file_hashes.add(h)
@@ -878,6 +925,13 @@ class UrlDownloader:
                         async with aiofiles.open(file_path, 'wb') as f:
                             await f.write(content)
 
+                        # FIX: remember hash->path and queue CSS for deep crawl
+                        rel_saved = self.url_local_map.get(url)
+                        if rel_saved:
+                            self.hash_paths[h] = rel_saved
+                        if file_path.endswith('.css'):
+                            self.css_sources[file_path] = url
+
                         self.stats["downloaded"] += 1
                         self.stats["total_bytes"] += len(content)
                         return True
@@ -889,6 +943,80 @@ class UrlDownloader:
             self.stats["failed"] += 1
             return False
 
+    def _page_key(self, url: str) -> str:
+        """FIX: normalized page identity (no query/fragment)."""
+        pr = urlparse(url)
+        return f"{pr.scheme}://{pr.netloc}{pr.path.rstrip('/') or '/'}"
+
+    def _link_pages(self, soup, base_url, page_dir):
+        """FIX: point internal <a href> at the downloaded html files."""
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            if not href or href.startswith(('#','mailto:','tel:','javascript:')):
+                continue
+            target = self.page_files.get(self._page_key(urljoin(base_url, href)))
+            if target:
+                try:
+                    a['href'] = os.path.relpath(target, page_dir).replace(os.sep, '/')
+                except Exception:
+                    pass
+
+    async def _process_css_assets(self, session, proxy=None):
+        """FIX: download assets referenced inside CSS files (background
+        images, @font-face fonts, @import) and rewrite them to local paths."""
+        saved = []
+        for _round in range(3):                      # follow @import chains
+            todo = [(fp, u) for fp, u in self.css_sources.items()
+                    if fp not in self.css_done]
+            if not todo:
+                break
+            for fp, src_url in todo:
+                self.css_done.add(fp)
+                try:
+                    async with aiofiles.open(fp, 'r', errors='ignore') as f:
+                        css = await f.read()
+                except Exception:
+                    continue
+                urls = [u for u in self._css_urls(css, src_url)
+                        if self._is_valid_url(u) and self._passes_filter(u)]
+                if urls:
+                    saved.extend(await self._download_all_resources(
+                        urls, self.root_folder, session, proxy))
+                try:
+                    async with aiofiles.open(fp, 'w') as f:
+                        await f.write(self._css_to_local(css, src_url,
+                                                         os.path.dirname(fp)))
+                except Exception:
+                    pass
+        return saved
+
+    def _css_to_local(self, css, base_url, css_dir):
+        """FIX: url(...) / @import -> relative path of the downloaded file."""
+        def to_local(u):
+            u = u.strip().strip('\'"')
+            if not u or u.startswith(('data:', 'blob:')):
+                return None
+            mapped = self.url_local_map.get(urljoin(base_url, u))
+            if not mapped:
+                return None
+            try:
+                return os.path.relpath(
+                    os.path.join(self.root_folder, mapped), css_dir
+                ).replace(os.sep, '/')
+            except Exception:
+                return None
+
+        def repl_url(m):
+            local = to_local(m.group(1))
+            return f'url("{local}")' if local else m.group(0)
+
+        def repl_import(m):
+            local = to_local(m.group(1))
+            return f'@import "{local}"' if local else m.group(0)
+
+        css = re.sub(r'url\s*\(\s*["\']?([^"\'()]+)["\']?\s*\)', repl_url, css)
+        return re.sub(r'@import\s+["\']([^"\']+)["\']', repl_import, css, flags=re.I)
+
     def _fix_css(self, css, base_url):
         def repl(m):
             u = m.group(1).strip('\'"')
@@ -898,24 +1026,53 @@ class UrlDownloader:
         return re.sub(r'url\s*\(\s*["\']?([^"\'()]+)["\']?\s*\)', repl, css)
 
     async def _update_html_paths(self, soup, base_url, pagefolder):
-        for img in soup.find_all('img'):
-            if img.get('src'):
-                lp = self._local_path(urljoin(base_url, img['src']), pagefolder)
-                if lp: img['src'] = lp
-        for link in soup.find_all('link'):
-            if link.get('href'):
-                lp = self._local_path(urljoin(base_url, link['href']), pagefolder)
-                if lp: link['href'] = lp
-        for script in soup.find_all('script'):
-            if script.get('src'):
-                lp = self._local_path(urljoin(base_url, script['src']), pagefolder)
-                if lp: script['src'] = lp
-        for source in soup.find_all('source'):
-            if source.get('src'):
-                lp = self._local_path(urljoin(base_url, source['src']), pagefolder)
-                if lp: source['src'] = lp
+        # FIX: rewrite EVERY asset attribute, not just src/href
+        URL_ATTRS = ['src', 'href', 'poster', 'data-src', 'data-lazy',
+                     'data-lazy-src', 'data-original', 'data-bg', 'data-image',
+                     'data-cover', 'data-poster', 'data-thumb']
+        for tag in soup.find_all(['img', 'link', 'script', 'source', 'video',
+                                  'audio', 'embed', 'object', 'iframe',
+                                  'track', 'div', 'span', 'section']):
+            for attr in URL_ATTRS:
+                val = tag.get(attr)
+                if not isinstance(val, str) or not val.strip():
+                    continue
+                if not self._is_valid_url(val):
+                    continue
+                lp = self._local_path(urljoin(base_url, val.strip()), pagefolder)
+                if lp:
+                    tag[attr] = lp
+            if tag.get('data') and tag.name == 'object':
+                lp = self._local_path(urljoin(base_url, tag['data']), pagefolder)
+                if lp: tag['data'] = lp
+            # FIX: srcset / imagesrcset entries
+            for sattr in ['srcset', 'imagesrcset', 'data-srcset']:
+                if not tag.get(sattr):
+                    continue
+                out = []
+                for entry in tag[sattr].split(','):
+                    parts = entry.strip().split()
+                    if not parts:
+                        continue
+                    lp = self._local_path(urljoin(base_url, parts[0]), pagefolder)
+                    parts[0] = lp or parts[0]
+                    out.append(' '.join(parts))
+                if out:
+                    tag[sattr] = ', '.join(out)
+        # FIX: inline style="background:url(...)" -> local
+        for tag in soup.find_all(style=True):
+            tag['style'] = self._css_to_local(tag['style'], base_url, pagefolder)
 
     def _local_path(self, url, pagefolder):
+        # FIX: prefer the real on-disk path (may be renamed: style_1.css)
+        mapped = self.url_local_map.get(url)
+        if mapped:
+            try:
+                return os.path.relpath(
+                    os.path.join(self.root_folder or pagefolder, mapped),
+                    pagefolder).replace(os.sep, '/')
+            except Exception:
+                return mapped
         try:
             p = unquote(urlparse(url).path)
             if not p or p == '/': return None
@@ -944,6 +1101,11 @@ class UrlDownloader:
             else:
                 ext = self._guess_ext(url) or 'bin'
                 fname = f"{fname}.{ext}"
+            # FIX: keep ?v=123 variants apart instead of colliding
+            if parsed.query:
+                name, e = os.path.splitext(fname)
+                qh = hashlib.md5(parsed.query.encode()).hexdigest()[:6]
+                fname = f"{name}_{qh}{e}"
             folder = self.extensions.get(ext, 'assets')
             if len(parts) > 1:
                 target = os.path.join(pagefolder, folder, *parts[:-1])
@@ -955,7 +1117,11 @@ class UrlDownloader:
                 name, e = os.path.splitext(base)
                 fname = f"{name}_{counter}{e}"
                 counter += 1
-            return os.path.join(target, fname)
+            full = os.path.join(target, fname)
+            # FIX: remember the REAL saved name so HTML rewriting matches disk
+            self.url_local_map[url] = os.path.relpath(
+                full, pagefolder).replace(os.sep, '/')
+            return full
         except Exception:
             return None
 
@@ -976,7 +1142,7 @@ class UrlDownloader:
             'User-Agent': get_ua(),
             'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'identity',
+            'Accept-Encoding': 'gzip, deflate, br',  # FIX: aiohttp decodes
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
             'Connection': 'keep-alive',
@@ -1225,8 +1391,10 @@ async def run_download(
         )
         timeout = aiohttp.ClientTimeout(total=600, connect=30, sock_read=45)
 
+        # FIX: decompress gzip/br, else .css/.js are saved as compressed
+        # binary and the browser treats them as corrupted.
         async with aiohttp.ClientSession(connector=connector, timeout=timeout,
-                                         auto_decompress=False) as session:
+                                         auto_decompress=True) as session:
             downloader = UrlDownloader(
                 imgFlg=images, linkFlg=css, scriptFlg=js,
                 max_retries=retries, crawl_depth=depth,
