@@ -129,10 +129,11 @@ def is_asset_ct(ct: str) -> bool:
 # core downloader
 # ──────────────────────────────────────────────────────────────────────
 class SiteDownloader:
-    def __init__(self, entry: str, max_pages: int, timeout_ms: int = 60000):
+    def __init__(self, entry: str, max_pages: int, timeout_ms: int = 60000, proxy: str = None):
         self.entry = strip_frag(norm_url(entry))
         self.max_pages = max(1, min(max_pages, 50))
         self.timeout_ms = timeout_ms
+        self.proxy = proxy
         self.out = WORK_ROOT / uuid.uuid4().hex
         self.assets_dir = self.out / "assets"
         self.out.mkdir(parents=True, exist_ok=True)
@@ -148,15 +149,18 @@ class SiteDownloader:
     async def run(self) -> dict:
         t0 = time.time()
         async with Stealth().use_async(async_playwright()) as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
+            launch_options = {
+                "headless": True,
+                "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
                 ],
-            )
+            }
+            if self.proxy:
+                launch_options["proxy"] = {"server": self.proxy}
+            browser = await pw.chromium.launch(**launch_options)
             ctx = await browser.new_context(
                 user_agent=UA,
                 viewport={"width": 1440, "height": 900},
@@ -390,10 +394,11 @@ def health():
 async def zip_website(
     url: str = Query(..., description="Website URL"),
     pages: int = Query(1, ge=1, le=50, description="Kitne pages crawl karne hain"),
+    proxy: str = Query(None, description="Optional Proxy (e.g., http://ip:port)"),
 ):
     cleanup()
     target = norm_url(url)
-    dl = SiteDownloader(target, max_pages=pages)
+    dl = SiteDownloader(target, max_pages=pages, proxy=proxy)
     try:
         stats = await dl.run()
     except HTTPException:
