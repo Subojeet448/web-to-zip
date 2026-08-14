@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 
 Install:
-    pip install fastapi uvicorn playwright beautifulsoup4 httpx --break-system-packages
+    pip install fastapi uvicorn playwright playwright-stealth beautifulsoup4 httpx --break-system-packages
     playwright install chromium
     playwright install-deps chromium     # linux/render pe zaroori
 
@@ -45,6 +45,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -146,7 +147,7 @@ class SiteDownloader:
     # ---------- browser capture ----------
     async def run(self) -> dict:
         t0 = time.time()
-        async with async_playwright() as pw:
+        async with Stealth().use_async(async_playwright()) as pw:
             browser = await pw.chromium.launch(
                 headless=True,
                 args=[
